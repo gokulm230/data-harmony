@@ -1,54 +1,160 @@
 import React, { useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import Papa from 'papaparse';
-import { Upload, FileSpreadsheet, Building2, Users, CheckCircle, AlertCircle, Loader2, Sparkles } from 'lucide-react';
+import { Upload, FileSpreadsheet, Building2, Users, AlertCircle, Loader2, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { useData } from '@/context/DataContext';
-import { parseCSVToCompanies, analyzeDataset, generateDemoData } from '@/lib/mockAiEngine';
+import { DatasetAnalysis } from '@/types/data';
 import { cn } from '@/lib/utils';
+
+// Transform API response to match DatasetAnalysis type
+const transformApiResponse = (apiData: any): DatasetAnalysis => {
+  const rowSummaries = apiData.row_summaries || [];
+  const stats = apiData.summary_statistics || {};
+  
+  const companies = rowSummaries.map((row: any) => {
+    const id = `row-${row.row}`;
+    const rowValues = row.row_values || {};
+    
+    // Build issues array
+    const issues = [];
+    if (row.name_suggestion === 'yes' && row.llm_suggested_name) {
+      issues.push({
+        field: 'name',
+        type: 'invalid' as const,
+        message: 'Name contains special characters or formatting issues',
+      });
+    }
+    if (row.is_duplicate) {
+      issues.push({
+        field: 'name',
+        type: 'duplicate' as const,
+        message: `Duplicate entry (rows: ${row.duplicate_group_rows?.join(', ')})`,
+      });
+    }
+    
+    // Build corrections array
+    const corrections = [];
+    if (row.name_suggestion === 'yes' && row.llm_suggested_name) {
+      corrections.push({
+        field: 'name',
+        originalValue: row.original_name,
+        correctedValue: row.llm_suggested_name,
+        type: 'corrected' as const,
+        confidence: 95,
+        label: 'AI-corrected company name',
+      });
+    }
+    
+    // Calculate quality score (before = with issues, after = after fixes)
+    const totalFields = 8;
+    const issueCount = issues.length;
+    const qualityBefore = Math.round(((totalFields - issueCount) / totalFields) * 100);
+    const qualityAfter = Math.round(((totalFields - Math.max(0, issueCount - corrections.length)) / totalFields) * 100);
+    
+    return {
+      original: {
+        id,
+        name: row.original_name || '',
+        website: rowValues.website || '',
+        domain: rowValues.domain || '',
+        industry: rowValues.industry || '',
+        country: rowValues.country || '',
+        size: rowValues.size || '',
+        revenue: rowValues.revenue || '',
+        contactEmail: rowValues.contactEmail || '',
+      },
+      corrected: {
+        id,
+        name: row.llm_suggested_name || row.original_name || '',
+        website: rowValues.website || '',
+        domain: rowValues.domain || '',
+        industry: rowValues.industry || '',
+        country: rowValues.country || '',
+        size: rowValues.size || '',
+        revenue: rowValues.revenue || '',
+        contactEmail: rowValues.contactEmail || '',
+      },
+      issues,
+      corrections,
+      qualityScore: {
+        before: qualityBefore,
+        after: qualityAfter,
+      },
+    };
+  });
+
+  // Remove duplicates - only keep the first occurrence
+  const uniqueCompanies = companies.filter((company: any, index: number) => {
+    const row = rowSummaries[index];
+    if (row.is_duplicate && row.duplicate_group_rows) {
+      // Keep only if this is the first row in the duplicate group
+      return row.row === Math.min(...row.duplicate_group_rows);
+    }
+    return true;
+  });
+
+  const totalIssues = stats.issue_counts?.duplicate_rows + 
+                      stats.issue_counts?.llm_name_corrections || 0;
+  const totalFixes = stats.issue_counts?.llm_name_corrections || 0;
+  
+  // Calculate overall quality (use API's score if available)
+  const qualityScore = stats.data_quality?.score || 0;
+  const overallQualityBefore = Math.round(qualityScore * 100);
+  const overallQualityAfter = Math.round((stats.data_quality?.clean_rows / stats.total_rows) * 100) || overallQualityBefore;
+
+  return {
+    companies: uniqueCompanies,
+    totalIssues,
+    totalFixes,
+    overallQualityBefore,
+    overallQualityAfter,
+  };
+};
 
 const UploadPage = () => {
   const navigate = useNavigate();
   const { setDatasetAnalysis, setIsProcessing, isProcessing } = useData();
   const [isDragging, setIsDragging] = useState(false);
+  const [response, setResponse] = useState(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const processCSV = useCallback(async (file: File) => {
+  const handleUpload = async (file: File) => {
     setIsProcessing(true);
     setError(null);
     setFileName(file.name);
 
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: async (results) => {
-        // Simulate AI processing delay
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        try {
-          const companies = parseCSVToCompanies(results.data as Record<string, string>[]);
-          if (companies.length === 0) {
-            setError('No valid company data found in CSV');
-            setIsProcessing(false);
-            return;
-          }
-          
-          const analysis = analyzeDataset(companies);
-          setDatasetAnalysis(analysis);
-          navigate('/companies');
-        } catch (err) {
-          setError('Failed to process CSV file');
-          setIsProcessing(false);
+    const formData = new FormData();
+    formData.append("file", file); 
+
+    try {
+      const res = await fetch(
+        "/api/analyze-csv",
+        {
+          method: "POST",
+          body: formData,
         }
-      },
-      error: () => {
-        setError('Failed to parse CSV file');
-        setIsProcessing(false);
-      },
-    });
-  }, [setDatasetAnalysis, setIsProcessing, navigate]);
+      );
+
+      if (!res.ok) {
+        throw new Error("File upload failed");
+      }
+
+      const data = await res.json();
+      console.log('API Response:', data);
+      
+      // Transform API response to DatasetAnalysis format
+      const transformedData = transformApiResponse(data);
+      setDatasetAnalysis(transformedData);
+      
+      setIsProcessing(false);
+      navigate('/companies');
+    } catch (err: any) {
+      setError(err.message || 'Failed to upload file');
+      setIsProcessing(false);
+    }
+  };
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -56,30 +162,21 @@ const UploadPage = () => {
     
     const file = e.dataTransfer.files[0];
     if (file && file.type === 'text/csv') {
-      processCSV(file);
+      handleUpload(file);
     } else {
       setError('Please upload a valid CSV file');
     }
-  }, [processCSV]);
+  }, []);
 
   const handleFileInput = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      processCSV(file);
+      handleUpload(file);
     }
-  }, [processCSV]);
+  }, []);
 
-  const handleDemoData = useCallback(async () => {
-    setIsProcessing(true);
-    setFileName('demo-dataset.csv');
-    
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    const companies = generateDemoData();
-    const analysis = analyzeDataset(companies);
-    setDatasetAnalysis(analysis);
-    navigate('/companies');
-  }, [setDatasetAnalysis, setIsProcessing, navigate]);
+
+
 
   return (
     <div className="min-h-screen gradient-hero flex flex-col">
@@ -152,9 +249,6 @@ const UploadPage = () => {
                       </span>
                     </Button>
                   </label>
-                  <Button variant="outline" size="lg" onClick={handleDemoData}>
-                    Try Demo Data
-                  </Button>
                 </div>
 
                 {error && (
@@ -167,40 +261,7 @@ const UploadPage = () => {
             )}
           </Card>
 
-          {/* Supported Fields */}
-          <div className="mt-10 grid md:grid-cols-2 gap-6">
-            <Card className="p-5 gradient-card">
-              <div className="flex items-center gap-3 mb-4">
-                <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center">
-                  <Building2 className="w-5 h-5 text-primary" />
-                </div>
-                <h4 className="font-semibold text-foreground">Company Fields</h4>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {['Name', 'Website', 'Domain', 'Industry', 'Country', 'Size', 'Revenue'].map(field => (
-                  <span key={field} className="px-2.5 py-1 bg-secondary text-secondary-foreground text-xs rounded-md">
-                    {field}
-                  </span>
-                ))}
-              </div>
-            </Card>
-            
-            <Card className="p-5 gradient-card">
-              <div className="flex items-center gap-3 mb-4">
-                <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center">
-                  <Users className="w-5 h-5 text-primary" />
-                </div>
-                <h4 className="font-semibold text-foreground">People Fields</h4>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {['Name', 'Title', 'Email', 'Phone', 'Function'].map(field => (
-                  <span key={field} className="px-2.5 py-1 bg-secondary text-secondary-foreground text-xs rounded-md">
-                    {field}
-                  </span>
-                ))}
-              </div>
-            </Card>
-          </div>
+          
         </div>
       </main>
     </div>
